@@ -1,0 +1,109 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: gas-db
+    environment:
+      POSTGRES_DB: gas_drainage
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+        -c work_mem=4MB
+        -c maintenance_work_mem=128MB
+        -c max_connections=100
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c default_statistics_target=100
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gas_drainage"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  mqtt:
+    image: eclipse-mosquitto:2.0.18
+    container_name: gas-mqtt
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mqttdata:/mosquitto/data
+      - mqttlog:/mosquitto/log
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    container_name: gas-backend
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: gas_drainage
+      DB_SSLMODE: disable
+      DB_MAX_CONNS: 50
+      MQTT_BROKER: tcp://mqtt:1883
+      SERVER_PORT: 8080
+      PPROF_PORT: 6060
+      OPTIMIZER_CONFIG: /app/config/optimizer.json
+      STATIC_DIR: /app/frontend/static
+    ports:
+      - "8080:8080"
+      - "6060:6060"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    restart: unless-stopped
+
+  dtu-simulator:
+    build:
+      context: ../scripts
+      dockerfile: Dockerfile.dtu
+    container_name: gas-dtu-sim
+    environment:
+      API_BASE: http://backend:8080
+      BOREHOLES: 600
+      INTERVAL: 120
+      CONC_MIN: 8.0
+      CONC_MAX: 65.0
+      FLOW_MIN: 0.3
+      FLOW_MAX: 5.0
+      NOISE_CONC: 2.0
+      NOISE_FLOW: 0.2
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  plc-simulator:
+    build:
+      context: ../scripts
+      dockerfile: Dockerfile.plc
+    container_name: gas-plc-sim
+    environment:
+      MQTT_BROKER: mqtt
+      MQTT_PORT: 1883
+      FAIL_RATE: 0.05
+      DELAY_MIN: 0.5
+      DELAY_MAX: 2.0
+    depends_on:
+      - mqtt
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  mqttdata:
+  mqttlog:

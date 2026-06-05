@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir paho-mqtt
+
+COPY plc_simulator.py .
+
+ENTRYPOINT ["python", "plc_simulator.py"]

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -70,8 +71,23 @@ func main() {
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 
-	fs := http.FileServer(http.Dir("../frontend/static"))
+	staticDir := getEnv("STATIC_DIR", "../frontend/static")
+	fs := http.FileServer(http.Dir(staticDir))
 	mux.Handle("/", fs)
+
+	pprofPort := getEnv("PPROF_PORT", "6060")
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+	pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	go func() {
+		log.Printf("pprof listening on :%s", pprofPort)
+		if err := http.ListenAndServe(":"+pprofPort, pprofMux); err != nil {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
 
 	port := getEnv("SERVER_PORT", "8080")
 	srv := &http.Server{

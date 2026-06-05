@@ -4,21 +4,26 @@ import random
 import requests
 import argparse
 import sys
+import os
 
 
-API_BASE = "http://localhost:8080"
+API_BASE = os.environ.get("API_BASE", "http://localhost:8080")
 
 
 class BoreholeSimulator:
-    def __init__(self, api_base, num_boreholes=600, interval=120, use_batch=True):
+    def __init__(self, api_base, num_boreholes=600, interval=120, use_batch=True,
+                 conc_range=(8.0, 65.0), flow_range=(0.3, 5.0),
+                 noise_conc=2.0, noise_flow=0.2):
         self.api_base = api_base
         self.num_boreholes = num_boreholes
         self.interval = interval
         self.use_batch = use_batch
+        self.noise_conc = noise_conc
+        self.noise_flow = noise_flow
         self.states = {}
         for i in range(1, num_boreholes + 1):
-            base_conc = random.uniform(8, 65)
-            base_flow = random.uniform(0.3, 5.0)
+            base_conc = random.uniform(conc_range[0], conc_range[1])
+            base_flow = random.uniform(flow_range[0], flow_range[1])
             base_pressure = random.uniform(18, 45)
             base_temp = random.uniform(16, 30)
             self.states[i] = {
@@ -32,9 +37,9 @@ class BoreholeSimulator:
 
     def generate_reading(self, borehole_id):
         s = self.states[borehole_id]
-        conc = s["base_conc"] + s["conc_trend"] * random.uniform(0, 3) + random.gauss(0, 2)
+        conc = s["base_conc"] + s["conc_trend"] * random.uniform(0, 3) + random.gauss(0, self.noise_conc)
         conc = max(0.5, min(80, conc))
-        flow = s["base_flow"] + s["flow_trend"] * random.uniform(0, 0.5) + random.gauss(0, 0.2)
+        flow = s["base_flow"] + s["flow_trend"] * random.uniform(0, 0.5) + random.gauss(0, self.noise_flow)
         flow = max(0.05, min(6, flow))
         pressure = s["base_pressure"] + random.gauss(0, 1.5)
         pressure = max(5, min(55, pressure))
@@ -97,14 +102,60 @@ class BoreholeSimulator:
             time.sleep(wait)
 
 
+def env_float(key, default):
+    v = os.environ.get(key)
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return default
+
+
+def env_int(key, default):
+    v = os.environ.get(key)
+    if v:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return default
+
+
 def main():
     parser = argparse.ArgumentParser(description="4G DTU Borehole Data Simulator")
-    parser.add_argument("--api", default="http://localhost:8080", help="Backend API URL")
-    parser.add_argument("--boreholes", type=int, default=600, help="Number of boreholes")
-    parser.add_argument("--interval", type=int, default=120, help="Reporting interval in seconds")
-    parser.add_argument("--no-batch", action="store_true", help="Disable batch API, use individual POST")
+    parser.add_argument("--api", default=os.environ.get("API_BASE", "http://localhost:8080"),
+                        help="Backend API URL")
+    parser.add_argument("--boreholes", type=int, default=env_int("BOREHOLES", 600),
+                        help="Number of boreholes")
+    parser.add_argument("--interval", type=int, default=env_int("INTERVAL", 120),
+                        help="Reporting interval in seconds")
+    parser.add_argument("--conc-min", type=float, default=env_float("CONC_MIN", 8.0),
+                        help="Minimum base gas concentration (%)")
+    parser.add_argument("--conc-max", type=float, default=env_float("CONC_MAX", 65.0),
+                        help="Maximum base gas concentration (%)")
+    parser.add_argument("--flow-min", type=float, default=env_float("FLOW_MIN", 0.3),
+                        help="Minimum base gas flow (m³/min)")
+    parser.add_argument("--flow-max", type=float, default=env_float("FLOW_MAX", 5.0),
+                        help="Maximum base gas flow (m³/min)")
+    parser.add_argument("--noise-conc", type=float, default=env_float("NOISE_CONC", 2.0),
+                        help="Concentration Gaussian noise std dev")
+    parser.add_argument("--noise-flow", type=float, default=env_float("NOISE_FLOW", 0.2),
+                        help="Flow Gaussian noise std dev")
+    parser.add_argument("--no-batch", action="store_true",
+                        help="Disable batch API, use individual POST")
     args = parser.parse_args()
-    sim = BoreholeSimulator(args.api, args.boreholes, args.interval, use_batch=not args.no_batch)
+
+    sim = BoreholeSimulator(
+        api_base=args.api,
+        num_boreholes=args.boreholes,
+        interval=args.interval,
+        use_batch=not args.no_batch,
+        conc_range=(args.conc_min, args.conc_max),
+        flow_range=(args.flow_min, args.flow_max),
+        noise_conc=args.noise_conc,
+        noise_flow=args.noise_flow,
+    )
     try:
         sim.run()
     except KeyboardInterrupt:

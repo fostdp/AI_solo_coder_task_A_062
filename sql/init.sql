@@ -85,8 +85,16 @@ CREATE INDEX IF NOT EXISTS idx_borehole_data_borehole_id ON borehole_data(boreho
 CREATE INDEX IF NOT EXISTS idx_borehole_data_recorded_at ON borehole_data(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_borehole_data_composite ON borehole_data(borehole_id, recorded_at);
 CREATE INDEX IF NOT EXISTS idx_pump_station_data_pump_id ON pump_station_data(pump_station_id);
+CREATE INDEX IF NOT EXISTS idx_pump_station_data_composite ON pump_station_data(pump_station_id, recorded_at);
 CREATE INDEX IF NOT EXISTS idx_alerts_unresolved ON alerts(is_resolved) WHERE is_resolved = FALSE;
 CREATE INDEX IF NOT EXISTS idx_boreholes_pump_station ON boreholes(pump_station_id);
+CREATE INDEX IF NOT EXISTS idx_plc_commands_created_at ON plc_commands(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_pump_stations_geom ON pump_stations USING GIST(geom);
+CREATE INDEX IF NOT EXISTS idx_boreholes_geom ON boreholes USING GIST(geom);
+CREATE INDEX IF NOT EXISTS idx_pipelines_geom ON pipelines USING GIST(geom);
+
+VACUUM ANALYZE;
 
 INSERT INTO pump_stations (id, name, geom, negative_pressure, status) VALUES
 (1, '1号泵站', ST_SetSRID(ST_MakePoint(106.550, 28.630), 4326), 40.0, 'normal'),
