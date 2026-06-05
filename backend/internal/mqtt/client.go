@@ -1,10 +1,12 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"gas-drainage-system/internal/database"
@@ -16,10 +18,28 @@ type Broadcaster interface {
 	Broadcast(msgType string, payload interface{})
 }
 
+const (
+	ackTimeout   = 5 * time.Second
+	maxRetries   = 3
+	retryDelay   = 2 * time.Second
+	cleanupInterval = 30 * time.Second
+)
+
+type pendingCommand struct {
+	TargetType string
+	TargetID   int
+	Command    interface{}
+	PublishAt  time.Time
+	Retries    int
+	AckChan    chan bool
+}
+
 type Client struct {
-	client mqtt.Client
-	db     *database.DB
-	hub    Broadcaster
+	client   mqtt.Client
+	db       *database.DB
+	hub      Broadcaster
+	pending  map[string]*pendingCommand
+	pendingMu sync.RWMutex
 }
 
 func NewClient(brokerURL, clientID string) *Client {
@@ -31,7 +51,8 @@ func NewClient(brokerURL, clientID string) *Client {
 	opts.SetConnectRetryInterval(5 * time.Second)
 	opts.SetKeepAlive(30 * time.Second)
 	return &Client{
-		client: mqtt.NewClient(opts),
+		client:  mqtt.NewClient(opts),
+		pending: make(map[string]*pendingCommand),
 	}
 }
 
@@ -49,6 +70,10 @@ func (c *Client) Connect() error {
 	return token.Error()
 }
 
+func commandKey(targetType string, targetID int) string {
+	return fmt.Sprintf("%s:%d", targetType, targetID)
+}
+
 func (c *Client) PublishCommand(targetType string, targetID int, command interface{}) error {
 	topic := fmt.Sprintf("gas/plc/%s/%d/command", targetType, targetID)
 	payload, err := json.Marshal(command)
@@ -58,6 +83,79 @@ func (c *Client) PublishCommand(targetType string, targetID int, command interfa
 	token := c.client.Publish(topic, 1, false, payload)
 	token.Wait()
 	return token.Error()
+}
+
+func (c *Client) PublishCommandWithAck(ctx context.Context, targetType string, targetID int, command interface{}) error {
+	key := commandKey(targetType, targetID)
+
+	ackChan := make(chan bool, 1)
+	pc := &pendingCommand{
+		TargetType: targetType,
+		TargetID:   targetID,
+		Command:    command,
+		PublishAt:  time.Now(),
+		Retries:    0,
+		AckChan:    ackChan,
+	}
+
+	c.pendingMu.Lock()
+	c.pending[key] = pc
+	c.pendingMu.Unlock()
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, key)
+		c.pendingMu.Unlock()
+	}()
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("MQTT command retry %d/%d for %s", attempt, maxRetries, key)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("command %s cancelled during retry: %w", key, ctx.Err())
+			case <-time.After(retryDelay):
+			}
+		}
+
+		if err := c.PublishCommand(targetType, targetID, command); err != nil {
+			log.Printf("MQTT publish error for %s: %v", key, err)
+			continue
+		}
+
+		c.hub.Broadcast("plc_command_status", map[string]interface{}{
+			"targetType": targetType,
+			"targetID":   targetID,
+			"status":     "sent",
+			"attempt":    attempt + 1,
+		})
+
+		select {
+		case acked := <-ackChan:
+			if acked {
+				c.hub.Broadcast("plc_command_status", map[string]interface{}{
+					"targetType": targetType,
+					"targetID":   targetID,
+					"status":     "acked",
+					"attempt":    attempt + 1,
+				})
+				return nil
+			}
+			log.Printf("PLC NACK for %s, retrying", key)
+		case <-time.After(ackTimeout):
+			log.Printf("MQTT ACK timeout for %s (attempt %d/%d)", key, attempt+1, maxRetries)
+			c.hub.Broadcast("plc_command_status", map[string]interface{}{
+				"targetType": targetType,
+				"targetID":   targetID,
+				"status":     "timeout",
+				"attempt":    attempt + 1,
+			})
+		case <-ctx.Done():
+			return fmt.Errorf("command %s cancelled: %w", key, ctx.Err())
+		}
+	}
+
+	return fmt.Errorf("command %s failed after %d retries", key, maxRetries)
 }
 
 func (c *Client) SubscribeFeedback() error {
@@ -81,9 +179,25 @@ func (c *Client) SubscribeFeedback() error {
 			return
 		}
 
+		var targetID int
+		fmt.Sscanf(targetIDStr, "%d", &targetID)
+		key := commandKey(targetType, targetID)
+
+		c.pendingMu.RLock()
+		pc, exists := c.pending[key]
+		c.pendingMu.RUnlock()
+
+		if exists {
+			select {
+			case pc.AckChan <- feedback.Success:
+			default:
+			}
+		}
+
+		status := "acked"
 		if !feedback.Success {
-			log.Printf("PLC command failed for %s/%s", targetType, targetIDStr)
-			return
+			status = "failed"
+			log.Printf("PLC command failed for %s", key)
 		}
 
 		c.hub.Broadcast("plc_feedback", map[string]interface{}{
@@ -93,10 +207,23 @@ func (c *Client) SubscribeFeedback() error {
 			"actualValue":  feedback.ActualValue,
 			"commandType":  feedback.CommandType,
 			"commandValue": feedback.CommandValue,
+			"status":       status,
 		})
 	})
 	token.Wait()
 	return token.Error()
+}
+
+func (c *Client) cleanupPending() {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	now := time.Now()
+	for key, pc := range c.pending {
+		if now.Sub(pc.PublishAt) > ackTimeout*time.Duration(maxRetries+1)+retryDelay*time.Duration(maxRetries) {
+			delete(c.pending, key)
+			log.Printf("cleaned up stale pending command: %s", key)
+		}
+	}
 }
 
 func (c *Client) Start() {
@@ -107,5 +234,12 @@ func (c *Client) Start() {
 	if err := c.SubscribeFeedback(); err != nil {
 		log.Printf("MQTT subscribe error: %v", err)
 	}
-	log.Println("MQTT client started")
+	go func() {
+		ticker := time.NewTicker(cleanupInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.cleanupPending()
+		}
+	}()
+	log.Println("MQTT client started with ACK tracking")
 }

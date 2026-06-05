@@ -1,12 +1,12 @@
 package database
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"gas-drainage-system/internal/models"
 )
@@ -18,35 +18,84 @@ type Config struct {
 	Password string
 	DBName   string
 	SSLMode  string
+	MaxConns int32
 }
 
 type DB struct {
-	*sql.DB
+	Pool *pgxpool.Pool
 }
 
 func NewPool(cfg Config) (*DB, error) {
-	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode)
-	db, err := sql.Open("postgres", connStr)
+	maxConns := cfg.MaxConns
+	if maxConns <= 0 {
+		maxConns = 50
+	}
+	connStr := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s pool_max_conns=%d pool_min_conns=5",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode, maxConns,
+	)
+	config, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if err := db.Ping(); err != nil {
-		return nil, err
+	config.HealthCheckPeriod = 30 * time.Second
+	config.MaxConnIdleTime = 5 * time.Minute
+	config.MaxConnLifetime = 1 * time.Hour
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
 	}
-	return &DB{db}, nil
+	if err := pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	return &DB{Pool: pool}, nil
 }
 
-func (db *DB) StoreBoreholeData(data models.BoreholeData) error {
-	_, err := db.Exec(
+func (db *DB) Close() {
+	db.Pool.Close()
+}
+
+func (db *DB) StoreBoreholeData(ctx context.Context, data models.BoreholeData) error {
+	_, err := db.Pool.Exec(ctx,
 		"INSERT INTO borehole_data (borehole_id, gas_flow, gas_concentration, negative_pressure, temperature, recorded_at) VALUES ($1, $2, $3, $4, $5, $6)",
 		data.BoreholeID, data.GasFlow, data.GasConcentration, data.NegativePressure, data.Temperature, data.RecordedAt,
 	)
 	return err
 }
 
-func (db *DB) StorePumpStationData(data models.PumpStationData) error {
-	_, err := db.Exec(
+func (db *DB) StoreBoreholeDataBatch(ctx context.Context, batch []models.BoreholeData) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Prepare(ctx, "batch_insert", `
+		INSERT INTO borehole_data (borehole_id, gas_flow, gas_concentration, negative_pressure, temperature, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`)
+	if err != nil {
+		return err
+	}
+	for _, d := range batch {
+		_, err = tx.Exec(ctx, "batch_insert",
+			d.BoreholeID, d.GasFlow, d.GasConcentration, d.NegativePressure, d.Temperature, d.RecordedAt,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (db *DB) StorePumpStationData(ctx context.Context, data models.PumpStationData) error {
+	_, err := db.Pool.Exec(ctx,
 		"INSERT INTO pump_station_data (pump_station_id, negative_pressure, flow_rate, efficiency, recorded_at) VALUES ($1, $2, $3, $4, $5)",
 		data.PumpStationID, data.NegativePressure, data.FlowRate, data.Efficiency, data.RecordedAt,
 	)
@@ -64,8 +113,8 @@ func computeScore(concentration, flow float64) float64 {
 	return score
 }
 
-func (db *DB) GetBoreholesWithLatestData() ([]models.Borehole, error) {
-	rows, err := db.Query(`
+func (db *DB) GetBoreholesWithLatestData(ctx context.Context) ([]models.Borehole, error) {
+	rows, err := db.Pool.Query(ctx, `
 		SELECT b.id, b.name, b.pump_station_id, ST_X(b.geom), ST_Y(b.geom),
 			b.valve_opening, b.target_valve_opening, b.status,
 			COALESCE(bd.gas_flow, 0), COALESCE(bd.gas_concentration, 0),
@@ -100,9 +149,9 @@ func (db *DB) GetBoreholesWithLatestData() ([]models.Borehole, error) {
 	return boreholes, rows.Err()
 }
 
-func (db *DB) GetBoreholeTrend(boreholeID int) (*models.BoreholeDetail, error) {
+func (db *DB) GetBoreholeTrend(ctx context.Context, boreholeID int) (*models.BoreholeDetail, error) {
 	var b models.Borehole
-	err := db.QueryRow(`
+	err := db.Pool.QueryRow(ctx, `
 		SELECT b.id, b.name, b.pump_station_id, ST_X(b.geom), ST_Y(b.geom),
 			b.valve_opening, b.target_valve_opening, b.status,
 			COALESCE(bd.gas_flow, 0), COALESCE(bd.gas_concentration, 0),
@@ -125,7 +174,7 @@ func (db *DB) GetBoreholeTrend(boreholeID int) (*models.BoreholeDetail, error) {
 	}
 	b.Score = computeScore(b.GasConcentration, b.GasFlow)
 
-	rows, err := db.Query(`
+	rows, err := db.Pool.Query(ctx, `
 		SELECT gas_flow, gas_concentration
 		FROM borehole_data
 		WHERE borehole_id = $1 AND recorded_at >= NOW() - INTERVAL '24 hours'
@@ -155,9 +204,9 @@ func (db *DB) GetBoreholeTrend(boreholeID int) (*models.BoreholeDetail, error) {
 	}, nil
 }
 
-func (db *DB) GetKPIData() (*models.KPIData, error) {
+func (db *DB) GetKPIData(ctx context.Context) (*models.KPIData, error) {
 	var kpi models.KPIData
-	err := db.QueryRow(`
+	err := db.Pool.QueryRow(ctx, `
 		SELECT
 			COALESCE((SELECT SUM(gas_flow) FROM borehole_data WHERE recorded_at >= NOW() - INTERVAL '1 hour'), 0),
 			COALESCE((SELECT AVG(gas_concentration) FROM borehole_data WHERE recorded_at >= NOW() - INTERVAL '1 hour'), 0),
@@ -173,8 +222,8 @@ type geoJSONLineString struct {
 	Coordinates [][]float64 `json:"coordinates"`
 }
 
-func (db *DB) GetPipelines() ([]models.Pipeline, error) {
-	rows, err := db.Query("SELECT id, name, pump_station_id, ST_AsGeoJSON(geom), diameter FROM pipelines ORDER BY id")
+func (db *DB) GetPipelines(ctx context.Context) ([]models.Pipeline, error) {
+	rows, err := db.Pool.Query(ctx, "SELECT id, name, pump_station_id, ST_AsGeoJSON(geom), diameter FROM pipelines ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -197,8 +246,8 @@ func (db *DB) GetPipelines() ([]models.Pipeline, error) {
 	return pipelines, rows.Err()
 }
 
-func (db *DB) GetPumpStations() ([]models.PumpStation, error) {
-	rows, err := db.Query("SELECT id, name, ST_X(geom), ST_Y(geom), negative_pressure, target_negative_pressure, status FROM pump_stations ORDER BY id")
+func (db *DB) GetPumpStations(ctx context.Context) ([]models.PumpStation, error) {
+	rows, err := db.Pool.Query(ctx, "SELECT id, name, ST_X(geom), ST_Y(geom), negative_pressure, target_negative_pressure, status FROM pump_stations ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -215,8 +264,8 @@ func (db *DB) GetPumpStations() ([]models.PumpStation, error) {
 	return stations, rows.Err()
 }
 
-func (db *DB) GetUnresolvedAlerts() ([]models.Alert, error) {
-	rows, err := db.Query(`
+func (db *DB) GetUnresolvedAlerts(ctx context.Context) ([]models.Alert, error) {
+	rows, err := db.Pool.Query(ctx, `
 		SELECT id, alert_type, level, source_id, source_type, COALESCE(message, ''), is_resolved, created_at, resolved_at
 		FROM alerts WHERE is_resolved = false ORDER BY created_at DESC
 	`)
@@ -236,52 +285,52 @@ func (db *DB) GetUnresolvedAlerts() ([]models.Alert, error) {
 	return alerts, rows.Err()
 }
 
-func (db *DB) StoreAlert(a models.Alert) error {
-	_, err := db.Exec(
+func (db *DB) StoreAlert(ctx context.Context, a models.Alert) error {
+	_, err := db.Pool.Exec(ctx,
 		"INSERT INTO alerts (alert_type, level, source_id, source_type, message, is_resolved, created_at, resolved_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
 		a.AlertType, a.Level, a.SourceID, a.SourceType, a.Message, a.IsResolved, a.CreatedAt, a.ResolvedAt,
 	)
 	return err
 }
 
-func (db *DB) StoreOptimizationResult(r models.OptimizationResult) error {
-	_, err := db.Exec(
+func (db *DB) StoreOptimizationResult(ctx context.Context, r models.OptimizationResult) error {
+	_, err := db.Pool.Exec(ctx,
 		"INSERT INTO optimization_results (result, total_concentration, created_at) VALUES ($1, $2, $3)",
 		string(r.Result), r.TotalConcentration, r.CreatedAt,
 	)
 	return err
 }
 
-func (db *DB) StorePLCCommand(c models.PLCCommand) error {
+func (db *DB) StorePLCCommand(ctx context.Context, c models.PLCCommand) error {
 	var executedAt interface{}
 	if c.ExecutedAt != nil {
 		executedAt = *c.ExecutedAt
 	}
-	_, err := db.Exec(
+	_, err := db.Pool.Exec(ctx,
 		"INSERT INTO plc_commands (target_type, target_id, command_type, command_value, status, mqtt_topic, created_at, executed_at, result) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 		c.TargetType, c.TargetID, c.CommandType, c.CommandValue, c.Status, c.MQTTTopic, c.CreatedAt, executedAt, c.Result,
 	)
 	return err
 }
 
-func (db *DB) UpdatePLCCommandResult(id int, status string, result string) error {
-	_, err := db.Exec(
+func (db *DB) UpdatePLCCommandResult(ctx context.Context, id int, status string, result string) error {
+	_, err := db.Pool.Exec(ctx,
 		"UPDATE plc_commands SET status = $1, result = $2, executed_at = $3 WHERE id = $4",
 		status, result, time.Now(), id,
 	)
 	return err
 }
 
-func (db *DB) UpdateBoreholeValve(id int, valveOpening float64) error {
-	_, err := db.Exec(
+func (db *DB) UpdateBoreholeValve(ctx context.Context, id int, valveOpening float64) error {
+	_, err := db.Pool.Exec(ctx,
 		"UPDATE boreholes SET valve_opening = $1 WHERE id = $2",
 		valveOpening, id,
 	)
 	return err
 }
 
-func (db *DB) UpdatePumpPressure(id int, negativePressure float64) error {
-	_, err := db.Exec(
+func (db *DB) UpdatePumpPressure(ctx context.Context, id int, negativePressure float64) error {
+	_, err := db.Pool.Exec(ctx,
 		"UPDATE pump_stations SET negative_pressure = $1 WHERE id = $2",
 		negativePressure, id,
 	)

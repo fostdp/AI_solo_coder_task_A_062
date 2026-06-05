@@ -1,6 +1,7 @@
 package alert
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
@@ -32,13 +33,15 @@ func (e *Engine) Start() {
 	ticker := time.NewTicker(e.checkInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		e.CheckLowEfficiency()
-		e.CheckPressureAnomaly()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		e.CheckLowEfficiency(ctx)
+		e.CheckPressureAnomaly(ctx)
+		cancel()
 	}
 }
 
-func (e *Engine) CheckLowEfficiency() {
-	rows, err := e.db.Query(`
+func (e *Engine) CheckLowEfficiency(ctx context.Context) {
+	rows, err := e.db.Pool.Query(ctx, `
 		SELECT borehole_id
 		FROM borehole_data
 		WHERE recorded_at > NOW() - INTERVAL '30 minutes'
@@ -59,7 +62,7 @@ func (e *Engine) CheckLowEfficiency() {
 		}
 
 		var exists bool
-		err := e.db.QueryRow(
+		err := e.db.Pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM alerts WHERE source_id = $1 AND alert_type = 'low_efficiency' AND created_at > NOW() - INTERVAL '30 minutes')`,
 			boreholeID,
 		).Scan(&exists)
@@ -76,7 +79,7 @@ func (e *Engine) CheckLowEfficiency() {
 			IsResolved: false,
 			CreatedAt:  time.Now(),
 		}
-		err = e.db.StoreAlert(a)
+		err = e.db.StoreAlert(ctx, a)
 		if err != nil {
 			log.Printf("insert alert error: %v", err)
 			continue
@@ -86,8 +89,8 @@ func (e *Engine) CheckLowEfficiency() {
 	}
 }
 
-func (e *Engine) CheckPressureAnomaly() {
-	rows, err := e.db.Query(`
+func (e *Engine) CheckPressureAnomaly(ctx context.Context) {
+	rows, err := e.db.Pool.Query(ctx, `
 		WITH avg_pressure AS (
 			SELECT pump_station_id, AVG(negative_pressure) AS avg_pressure
 			FROM pump_station_data
@@ -120,7 +123,7 @@ func (e *Engine) CheckPressureAnomaly() {
 		}
 
 		var exists bool
-		err := e.db.QueryRow(
+		err := e.db.Pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM alerts WHERE source_id = $1 AND alert_type = 'pressure_anomaly' AND created_at > NOW() - INTERVAL '1 hour')`,
 			strconv.Itoa(stationID),
 		).Scan(&exists)
@@ -137,7 +140,7 @@ func (e *Engine) CheckPressureAnomaly() {
 			IsResolved: false,
 			CreatedAt:  time.Now(),
 		}
-		err = e.db.StoreAlert(a)
+		err = e.db.StoreAlert(ctx, a)
 		if err != nil {
 			log.Printf("insert alert error: %v", err)
 			continue

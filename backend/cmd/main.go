@@ -21,6 +21,7 @@ func main() {
 		Password: getEnv("DB_PASSWORD", "postgres"),
 		DBName:   getEnv("DB_NAME", "gas_drainage"),
 		SSLMode:  getEnv("DB_SSLMODE", "disable"),
+		MaxConns: int32(getEnvInt("DB_MAX_CONNS", 50)),
 	}
 
 	db, err := database.NewPool(cfg)
@@ -28,6 +29,7 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
+	log.Printf("Database pool initialized (max_conns=%d)", cfg.MaxConns)
 
 	hub := handler.NewHub()
 	go hub.Run()
