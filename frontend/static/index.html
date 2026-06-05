@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智慧煤矿瓦斯抽采管网智能调控系统</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <header id="header">
+        <div class="header-left">
+            <h1>智慧煤矿瓦斯抽采管网智能调控系统</h1>
+        </div>
+        <div class="header-right">
+            <div class="kpi-card">
+                <span class="kpi-label">管网总流量</span>
+                <span class="kpi-value" id="kpi-total-flow">--</span>
+                <span class="kpi-unit">m³/min</span>
+            </div>
+            <div class="kpi-card">
+                <span class="kpi-label">平均浓度</span>
+                <span class="kpi-value" id="kpi-avg-conc">--</span>
+                <span class="kpi-unit">%</span>
+            </div>
+            <div class="kpi-card">
+                <span class="kpi-label">泵站效率</span>
+                <span class="kpi-value" id="kpi-pump-eff">--</span>
+                <span class="kpi-unit">%</span>
+            </div>
+        </div>
+    </header>
+    <main>
+        <div id="canvas-container">
+            <canvas id="network-canvas"></canvas>
+        </div>
+        <aside id="sidebar" class="hidden">
+            <div class="sidebar-header">
+                <h2 id="sidebar-title">钻孔详情</h2>
+                <button id="sidebar-close">&times;</button>
+            </div>
+            <div class="sidebar-body">
+                <div class="info-grid" id="borehole-info"></div>
+                <div class="chart-section">
+                    <h3>近24小时流量趋势</h3>
+                    <canvas id="flow-chart" height="150"></canvas>
+                </div>
+                <div class="chart-section">
+                    <h3>近24小时浓度趋势</h3>
+                    <canvas id="conc-chart" height="150"></canvas>
+                </div>
+            </div>
+        </aside>
+    </main>
+    <div id="alert-panel">
+        <div class="alert-header" id="alert-toggle">
+            <span>告警信息</span>
+            <span class="alert-count" id="alert-count">0</span>
+        </div>
+        <div class="alert-list" id="alert-list"></div>
+    </div>
+    <div id="optimization-panel" class="hidden">
+        <div class="opt-header">
+            <h3>管网优化调控建议</h3>
+            <button id="opt-close">&times;</button>
+        </div>
+        <div id="opt-content"></div>
+        <button id="opt-apply-btn" class="btn-primary">下发调控指令</button>
+    </div>
+    <div id="toolbar">
+        <button id="btn-optimize" class="btn-primary">优化调控</button>
+        <button id="btn-alerts" class="btn-secondary">告警列表</button>
+    </div>
+    <script src="/js/app.js"></script>
+</body>
+</html>
