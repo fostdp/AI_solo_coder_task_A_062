@@ -1,4 +1,4 @@
-package alert
+package alarm_monitor
 
 import (
 	"context"
@@ -15,33 +15,54 @@ type Broadcaster interface {
 	Broadcast(msgType string, payload interface{})
 }
 
-type Engine struct {
-	db            *database.DB
-	hub           Broadcaster
-	checkInterval time.Duration
+type AlarmMonitor struct {
+	db        *database.DB
+	hub       Broadcaster
+	TriggerCh chan struct{}
+	interval  time.Duration
 }
 
-func NewEngine(db *database.DB, hub Broadcaster, checkInterval time.Duration) *Engine {
-	return &Engine{
-		db:            db,
-		hub:           hub,
-		checkInterval: checkInterval,
+func NewAlarmMonitor(db *database.DB, hub Broadcaster, interval time.Duration) *AlarmMonitor {
+	return &AlarmMonitor{
+		db:        db,
+		hub:       hub,
+		TriggerCh: make(chan struct{}, 1),
+		interval:  interval,
 	}
 }
 
-func (e *Engine) Start() {
-	ticker := time.NewTicker(e.checkInterval)
-	defer ticker.Stop()
-	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		e.CheckLowEfficiency(ctx)
-		e.CheckPressureAnomaly(ctx)
-		cancel()
+func (m *AlarmMonitor) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(m.interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				select {
+				case m.TriggerCh <- struct{}{}:
+				default:
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-m.TriggerCh:
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			m.CheckLowEfficiency(checkCtx)
+			m.CheckPressureAnomaly(checkCtx)
+			cancel()
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
-func (e *Engine) CheckLowEfficiency(ctx context.Context) {
-	rows, err := e.db.Pool.Query(ctx, `
+func (m *AlarmMonitor) CheckLowEfficiency(ctx context.Context) {
+	rows, err := m.db.Pool.Query(ctx, `
 		SELECT borehole_id
 		FROM borehole_data
 		WHERE recorded_at > NOW() - INTERVAL '30 minutes'
@@ -62,7 +83,7 @@ func (e *Engine) CheckLowEfficiency(ctx context.Context) {
 		}
 
 		var exists bool
-		err := e.db.Pool.QueryRow(ctx,
+		err := m.db.Pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM alerts WHERE source_id = $1 AND alert_type = 'low_efficiency' AND created_at > NOW() - INTERVAL '30 minutes')`,
 			boreholeID,
 		).Scan(&exists)
@@ -79,18 +100,18 @@ func (e *Engine) CheckLowEfficiency(ctx context.Context) {
 			IsResolved: false,
 			CreatedAt:  time.Now(),
 		}
-		err = e.db.StoreAlert(ctx, a)
+		err = m.db.StoreAlert(ctx, a)
 		if err != nil {
 			log.Printf("insert alert error: %v", err)
 			continue
 		}
 
-		e.hub.Broadcast("alert", a)
+		m.hub.Broadcast("alert", a)
 	}
 }
 
-func (e *Engine) CheckPressureAnomaly(ctx context.Context) {
-	rows, err := e.db.Pool.Query(ctx, `
+func (m *AlarmMonitor) CheckPressureAnomaly(ctx context.Context) {
+	rows, err := m.db.Pool.Query(ctx, `
 		WITH avg_pressure AS (
 			SELECT pump_station_id, AVG(negative_pressure) AS avg_pressure
 			FROM pump_station_data
@@ -123,7 +144,7 @@ func (e *Engine) CheckPressureAnomaly(ctx context.Context) {
 		}
 
 		var exists bool
-		err := e.db.Pool.QueryRow(ctx,
+		err := m.db.Pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM alerts WHERE source_id = $1 AND alert_type = 'pressure_anomaly' AND created_at > NOW() - INTERVAL '1 hour')`,
 			strconv.Itoa(stationID),
 		).Scan(&exists)
@@ -140,12 +161,12 @@ func (e *Engine) CheckPressureAnomaly(ctx context.Context) {
 			IsResolved: false,
 			CreatedAt:  time.Now(),
 		}
-		err = e.db.StoreAlert(ctx, a)
+		err = m.db.StoreAlert(ctx, a)
 		if err != nil {
 			log.Printf("insert alert error: %v", err)
 			continue
 		}
 
-		e.hub.Broadcast("alert", a)
+		m.hub.Broadcast("alert", a)
 	}
 }

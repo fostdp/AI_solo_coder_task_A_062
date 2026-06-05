@@ -4,26 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
 
 	"gas-drainage-system/internal/database"
+	"gas-drainage-system/internal/data_collector"
 	"gas-drainage-system/internal/models"
-	"gas-drainage-system/internal/optimizer"
+	"gas-drainage-system/internal/network_optimizer"
 
 	"github.com/jackc/pgx/v5"
 )
 
 type Handler struct {
-	db  *database.DB
-	hub *Hub
-	opt *optimizer.Optimizer
+	db   *database.DB
+	hub  *Hub
+	coll *data_collector.DataCollector
+	opt  *network_optimizer.NetworkOptimizer
 }
 
-func NewHandler(db *database.DB, hub *Hub, opt *optimizer.Optimizer) *Handler {
-	return &Handler{db: db, hub: hub, opt: opt}
+func NewHandler(db *database.DB, hub *Hub, coll *data_collector.DataCollector, opt *network_optimizer.NetworkOptimizer) *Handler {
+	return &Handler{db: db, hub: hub, coll: coll, opt: opt}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -196,21 +197,19 @@ func (h *Handler) handleRunOptimization(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		result, err := h.opt.Run(ctx)
-		if err != nil {
-			log.Printf("optimization run error: %v", err)
-		} else {
-			log.Printf("optimization complete: fitness=%.4f, gens=%d, timedOut=%v", result.Fitness, result.Generations, result.TimedOut)
-		}
-	}()
+	req := &network_optimizer.OptimizeRequest{
+		Response: nil,
+	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "running",
-		"message": "优化计算已启动（最大5秒），请稍后查看结果",
-	})
+	select {
+	case h.opt.OptimizeCh <- req:
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "running",
+			"message": "优化计算已启动，结果将通过WebSocket推送",
+		})
+	default:
+		http.Error(w, "optimization queue full", http.StatusServiceUnavailable)
+	}
 }
 
 func (h *Handler) handleGetPLCCommands(w http.ResponseWriter, r *http.Request) {
@@ -241,61 +240,102 @@ func (h *Handler) handleGetPLCCommands(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handlePostBoreholeData(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-
-	var bd models.BoreholeData
-	if err := json.NewDecoder(r.Body).Decode(&bd); err != nil {
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	if err := h.db.StoreBoreholeData(ctx, bd); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	respCh := make(chan *data_collector.DataResponse, 1)
+	evt := &data_collector.DataEvent{
+		Kind:     "borehole",
+		Payload:  raw,
+		Response: respCh,
+	}
+
+	select {
+	case h.coll.DataCh <- evt:
+	case <-time.After(3 * time.Second):
+		http.Error(w, "data collector busy", http.StatusServiceUnavailable)
 		return
 	}
 
-	h.hub.Broadcast("borehole_update", bd)
-	writeJSON(w, http.StatusCreated, bd)
+	select {
+	case resp := <-respCh:
+		if resp.Error != nil {
+			http.Error(w, resp.Error.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp.Data)
+	case <-time.After(5 * time.Second):
+		http.Error(w, "write timeout", http.StatusGatewayTimeout)
+	}
 }
 
 func (h *Handler) handlePostBoreholeDataBatch(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	var batch []models.BoreholeData
-	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	if err := h.db.StoreBoreholeDataBatch(ctx, batch); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	respCh := make(chan *data_collector.DataResponse, 1)
+	evt := &data_collector.DataEvent{
+		Kind:     "borehole_batch",
+		Payload:  raw,
+		Response: respCh,
+	}
+
+	select {
+	case h.coll.DataCh <- evt:
+	case <-time.After(5 * time.Second):
+		http.Error(w, "data collector busy", http.StatusServiceUnavailable)
 		return
 	}
 
-	h.hub.Broadcast("borehole_update", map[string]interface{}{
-		"count": len(batch),
-	})
-	writeJSON(w, http.StatusCreated, map[string]int{"count": len(batch)})
+	select {
+	case resp := <-respCh:
+		if resp.Error != nil {
+			http.Error(w, resp.Error.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp.Data)
+	case <-time.After(10 * time.Second):
+		http.Error(w, "batch write timeout", http.StatusGatewayTimeout)
+	}
 }
 
 func (h *Handler) handlePostPumpStationData(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-
-	var psd models.PumpStationData
-	if err := json.NewDecoder(r.Body).Decode(&psd); err != nil {
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	if err := h.db.StorePumpStationData(ctx, psd); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	respCh := make(chan *data_collector.DataResponse, 1)
+	evt := &data_collector.DataEvent{
+		Kind:     "pump_station",
+		Payload:  raw,
+		Response: respCh,
+	}
+
+	select {
+	case h.coll.DataCh <- evt:
+	case <-time.After(3 * time.Second):
+		http.Error(w, "data collector busy", http.StatusServiceUnavailable)
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, psd)
+	select {
+	case resp := <-respCh:
+		if resp.Error != nil {
+			http.Error(w, resp.Error.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, resp.Data)
+	case <-time.After(5 * time.Second):
+		http.Error(w, "write timeout", http.StatusGatewayTimeout)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

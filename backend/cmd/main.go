@@ -1,16 +1,21 @@
 package main
 
 import (
-	"gas-drainage-system/internal/alert"
-	"gas-drainage-system/internal/database"
-	"gas-drainage-system/internal/handler"
-	"gas-drainage-system/internal/mqtt"
-	"gas-drainage-system/internal/optimizer"
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
+
+	"gas-drainage-system/internal/alarm_monitor"
+	"gas-drainage-system/internal/command_dispatcher"
+	"gas-drainage-system/internal/data_collector"
+	"gas-drainage-system/internal/database"
+	"gas-drainage-system/internal/handler"
+	"gas-drainage-system/internal/network_optimizer"
 )
 
 func main() {
@@ -34,20 +39,33 @@ func main() {
 	hub := handler.NewHub()
 	go hub.Run()
 
-	mqttClient := mqtt.NewClient(
+	collector := data_collector.NewDataCollector(db, hub)
+	go collector.Start()
+
+	dispatcher := command_dispatcher.NewCommandDispatcher(
 		getEnv("MQTT_BROKER", "tcp://localhost:1883"),
 		"gas-drainage-server",
+		db,
+		hub,
 	)
-	mqttClient.SetDB(db)
-	mqttClient.SetHub(hub)
-	go mqttClient.Start()
 
-	alertEngine := alert.NewEngine(db, hub, 1*time.Minute)
-	go alertEngine.Start()
+	optConfigPath := getEnv("OPTIMIZER_CONFIG", "config/optimizer.json")
+	optCfg, err := network_optimizer.LoadConfig(optConfigPath)
+	if err != nil {
+		log.Printf("Failed to load optimizer config from %s: %v, using defaults", optConfigPath, err)
+		optCfg = network_optimizer.DefaultConfig()
+	}
+	log.Printf("Optimizer config: pop=%d gens=%d stagnation=%d timeout=%vs",
+		optCfg.PopulationSize, optCfg.MaxGenerations, optCfg.StagnationLimit,
+		optCfg.MaxOptimizationTimeSeconds)
 
-	opt := optimizer.NewOptimizer(db, hub, mqttClient)
+	optimizer := network_optimizer.NewNetworkOptimizer(db, hub, dispatcher, optCfg)
+	go optimizer.Start(context.Background())
 
-	h := handler.NewHandler(db, hub, opt)
+	monitor := alarm_monitor.NewAlarmMonitor(db, hub, 1*time.Minute)
+	go monitor.Start(context.Background())
+
+	h := handler.NewHandler(db, hub, collector, optimizer)
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
@@ -56,10 +74,38 @@ func main() {
 	mux.Handle("/", fs)
 
 	port := getEnv("SERVER_PORT", "8080")
-	log.Printf("Server starting on port %s", port)
-	if err := http.ListenAndServe(":"+port, corsMiddleware(mux)); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: corsMiddleware(mux),
 	}
+
+	go func() {
+		log.Printf("Server starting on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := dispatcher.Start(ctx); err != nil {
+			log.Printf("MQTT dispatcher error: %v", err)
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	log.Println("Shutting down...")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	srv.Shutdown(shutdownCtx)
+	cancel()
+	time.Sleep(2 * time.Second)
+	log.Println("Server stopped")
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

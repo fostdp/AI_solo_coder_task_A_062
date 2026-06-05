@@ -1,0 +1,14 @@
+{
+  "population_size": 100,
+  "max_generations": 200,
+  "elite_count": 5,
+  "tournament_size": 3,
+  "mutation_rate": 0.1,
+  "crossover_rate": 0.5,
+  "pump_min": 20.0,
+  "pump_max": 60.0,
+  "valve_min": 0.0,
+  "valve_max": 100.0,
+  "max_optimization_time_seconds": 5,
+  "stagnation_limit": 30
+}
